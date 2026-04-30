@@ -1,65 +1,46 @@
-# This file to try to run MPC on the joint B linear actuator.
+# Cascade Architecture: Outer Loop MPC
+# Generates current and voltage setpoints for an inner SMC loop.
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.linalg import block_diag
-from scipy.optimize import minimize
 from casadi import *
 
 # Time parameters
-dT = 0.05  # Time step (seconds)
-N = 20  # Prediction horizon (number of steps)
+dT = 0.05  # Time step (seconds) runs much slower than SMC
+N = 20     # Prediction horizon (number of steps)
 
-# Circuit constants
-R = 1e6  # Resistance (Ohms)
-Ra = 35.0  # Resistance of armature (Ohms)
-La = 1.2e-3  # Inductance of motor (Henries)
-L = 10e-3  # Inductance
-C = 100e-6  # Capacitance (Farads)
-J = 6e-7  # Inertia (kg*m^2)
-b_damp = 1e-5  # Viscous damping (N*m*s/rad)
-Kt = 0.032  # Torque constant (N*m/A)
+# Circuit & Motor constants
+Ra = 35.0    # Resistance of armature (Ohms)
+J = 6e-7     # Inertia (kg*m^2)
+b_damp = 4e-5 # Viscous damping (N*m*s/rad)
+Kt = 0.032   # Torque constant (N*m/A)
 Ke = 0.0435  # Back EMF constant (V*s/rad)
-Vin = 36.0  # Input voltage (Volts)
+Vin = 36.0   # Input battery voltage (Volts)
 
-# Add position to state variables
-il = MX.sym("il")
-vc = MX.sym("vc")
-ila = MX.sym("ila")
+# Target constraints
+target_rpm = 4000.0
+target_w = target_rpm * (2 * np.pi / 60.0) # Convert RPM to rad/s
+
+# 1. NEW STATE VECTOR (Mechanical Only)
 w = MX.sym("w")
-theta = MX.sym("theta") # NEW STATE
-x = vertcat(il, vc, ila, w, theta) # Now a 5x1 vector
+theta = MX.sym("theta")
+x = vertcat(w, theta) # Reduced to a 2x1 vector
 
-# Control input
-u1 = MX.sym("u1")
-u2 = MX.sym("u2")
-u = vertcat(u1, u2)
+# 2. NEW CONTROL INPUTS (Setpoints for the SMC)
+i_la_ref = MX.sym("i_la_ref")
+vc_ref = MX.sym("vc_ref")
+u = vertcat(i_la_ref, vc_ref)
 
-A_mat = vertcat(
-    horzcat(0, -1/L, 0, 0, 0),
-    horzcat(1/C, -1/(R*C), -1/C, 0, 0),
-    horzcat(0, -1/La, -Ra/La, -Ke/La, 0),
-    horzcat(0, 0, Kt/J, -b_damp/J, 0),
-    horzcat(0, 0, 0, 1, 0)  # d(theta)/dt = w
-)
+# 3. CONTINUOUS DYNAMICS (Assuming electrical loop settles instantly)
+w_dot = (Kt/J) * i_la_ref - (b_damp/J) * w
+theta_dot = w
+x_dot = vertcat(w_dot, theta_dot)
 
-B_mat = vertcat(
-    horzcat(0, 0, 0, 0, 0),
-    horzcat(0, 0, 2/C, 0, 0),
-    horzcat(0, 2/La, 0, 0, 0),
-    horzcat(0, 0, 0, 0, 0),
-    horzcat(0, 0, 0, 0, 0)
-)
+f = Function('f', [x, u], [x_dot])
 
-C_mat = vertcat(Vin/L, 0, 0, 0, 0)
-
-# Update the continuous dynamics function
-f = Function('f', [x, u], [A_mat @ x + B_mat @ x * u2 + C_mat * u1])
-
+# RK4 Integration
 k1 = f(x, u)
 k2 = f(x + dT/2 * k1, u)
 k3 = f(x + dT/2 * k2, u)
 k4 = f(x + dT * k3, u)
-
 x_next = x + dT/6 * (k1 + 2*k2 + 2*k3 + k4)
 
 # Discrete time dynamics function
@@ -68,41 +49,48 @@ F_discrete = Function('F_discrete', [x, u], [x_next])
 # Optimization
 opti = Opti()
 
-X = opti.variable(5, N+1)  # State trajectory
-U = opti.variable(2, N)    # Control trajectory
+X = opti.variable(2, N+1)  # State trajectory
+U = opti.variable(2, N)    # Control trajectory (references)
 
-# Parameter for the initial state (so we can update it in our real-time control loop)
-x_initial = opti.parameter(5, 1)
-opti.set_value(x_initial, np.zeros((5, 1)))  # Initial state
+# Initial state: 0 RPM, 0 radians
+x_initial = opti.parameter(2, 1)
+opti.set_value(x_initial, [0.0, 0.0])  
 
-# Constraints
-opti.subject_to(X[:, 0] == x_initial)  # Initial state constraint
+opti.subject_to(X[:, 0] == x_initial)  
 
-
-# Add a weight for position (index 4) - let's make it the highest priority
-Q = np.diag([1.0, 1.0, 5.0, 5.0, 20.0])  
-R = np.diag([0.1, 0.1])  
-
-# New physically valid target: Stop moving at an angle of 3.14 radians (180 degrees)
-target_angle = np.pi 
-x_target = vertcat(0, 0, 0, 0, target_angle)
+# Weights
+Q_w = 100.0  # High priority on hitting target velocity
+R_i = 1.0    # Small penalty to minimize extreme current usage
+R_v = 0.1    # Small penalty to minimize high voltage targets
 
 cost = 0
 
 for k in range(N):
-    opti.subject_to(X[:, k + 1] == F_discrete(X[:, k], U[:, k]))  # System dynamics constraints
+    opti.subject_to(X[:, k + 1] == F_discrete(X[:, k], U[:, k])) 
     
-    # Bounding of duty cycle
-    opti.subject_to(opti.bounded(0, U[0, k], 1))  # Control input constraints
-    opti.subject_to(opti.bounded(0, U[1, k], 1))  # Control input constraints
+    w_k = X[0, k]
+    i_ref_k = U[0, k]
+    vc_ref_k = U[1, k]
+    
+    # SMC REACHABILITY CONSTRAINTS
+    # The capacitor voltage MUST be high enough to overcome resistive drop and back-EMF.
+    # We add a 1.0V margin to ensure robust sliding mode control.
+    # We use two linear constraints to act as an absolute value bounding box.
+    margin = 1.0
+    opti.subject_to(vc_ref_k >= (Ra * i_ref_k + Ke * w_k) + margin)
+    opti.subject_to(vc_ref_k >= -(Ra * i_ref_k + Ke * w_k) + margin)
 
-    # Cost function
-    state_error = X[:, k] - x_target
-    cost += state_error.T @ Q @ state_error + U[:, k].T @ R @ U[:, k]
+    # Physical hardware limits
+    opti.subject_to(opti.bounded(-1.5, i_ref_k, 1.5)) # Max current roughly Vin/Ra
+    opti.subject_to(opti.bounded(0, vc_ref_k, Vin))   # Cannot ask for more voltage than battery has
+
+    # Cost function (Ignore theta since we only care about velocity for now)
+    velocity_error = w_k - target_w
+    cost += Q_w * (velocity_error**2) + R_i * (i_ref_k**2) + R_v * (vc_ref_k**2)
 
 # Terminal cost
-state_error_terminal = X[:, N] - x_target
-cost += state_error_terminal.T @ Q @ state_error_terminal
+velocity_error_terminal = X[0, N] - target_w
+cost += Q_w * (velocity_error_terminal**2)
 
 opti.minimize(cost)
 
@@ -111,21 +99,21 @@ opti.solver("ipopt", opts)
 
 try:
     sol = opti.solve()
-    print(sol.stats()["iter_count"])
-    X_result = sol.value(X)
-    U_result = sol.value(U)
+    print("Solver converged! 🚀")
+    print(f"Targeting a constant {target_rpm} RPM ({target_w:.3f} rad/s)\n")
+    
     for k in range(N):
-        print(f"Time step {k}: Control input = {sol.value(U[:, k])}, State = {sol.value(X[:, k])}")
+        w_val = sol.value(X[0, k])
+        i_ref_val = sol.value(U[0, k])
+        vc_ref_val = sol.value(U[1, k])
+        
+        # Convert rad/s back to RPM for readable console output
+        rpm_val = w_val * (60.0 / (2 * np.pi))
+        
+        print(f"Step {k:02d}: Speed = {rpm_val:05.2f} RPM | SMC Setpoints -> Target Current: {i_ref_val:5.2f} A, Target Voltage: {vc_ref_val:5.2f} V")
+        
 except RuntimeError:
     print("Solver failed to converge. Catching debug values... 🪲")
     X_debug = opti.debug.value(X)
-    U_debug = opti.debug.value(U)
-
-    # Print the state trajectory to see where it went wrong
     print("\n--- Failed State Trajectory (X) ---")
-    # Rounding makes the matrix much easier to read in the terminal
     print(np.round(X_debug, 3))
-
-
-
-
