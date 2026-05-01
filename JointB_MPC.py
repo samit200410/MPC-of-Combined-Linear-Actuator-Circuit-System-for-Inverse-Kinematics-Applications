@@ -6,7 +6,7 @@ from casadi import *
 # 1. PARAMETERS & INITIALIZATION
 # ==========================================
 dt_outer = 0.05      # MPC loop runs at 20 Hz
-dt_inner = 0.0001    # SMC loop runs at 10 kHz
+dt_inner = 0.00001    # SMC loop runs at 100 kHz (Faster than the 34us motor pole)
 sim_time = 1.0       # Simulate for 1 second
 steps_outer = int(sim_time / dt_outer)
 steps_inner_per_outer = int(dt_outer / dt_inner)
@@ -31,12 +31,25 @@ target_w = target_rpm * (2 * np.pi / 60.0)
 # 2. INNER LOOP: SMC CONTROLLERS
 # ==========================================
 def smc_buck_duty_cycle(v_target, v_c, i_l, i_la):
-    lam, K, Phi = 500.0, 0.5, 500.0
+    """ Second-order SMC for Buck Converter (Outputs Duty Cycle 0.0 to 1.0) """
+    lam = 500.0  
+    K = 1.0      # Increased gain to guarantee full saturation 
+    Phi = 500.0  
+
+    # 1. Define the multi-state sliding surface (S2)
     S2 = -(1/C)*i_l + (1/(R*C))*v_c + (1/C)*i_la + lam*(v_target - v_c)
+
+    # 2. Calculate continuous physical dynamics (H_smc) and control gain (g_smc)
     H_smc = (v_c / (L*C)) + (1/(R*C) - lam) * ((1/C)*i_l - (1/(R*C))*v_c - (1/C)*i_la)
     g_smc = -Vin / (L*C)
+
+    # 3. Calculate Equivalent Control
     u_eq = -H_smc / g_smc
-    u1_raw = u_eq - K * np.clip(S2 / Phi, -1.0, 1.0)
+
+    # 4. THE FIX: ADD the boundary layer effort because g_smc is negative!
+    u1_raw = u_eq + K * np.clip(S2 / Phi, -1.0, 1.0)
+    
+    # 5. Bound to a physical duty cycle
     return np.clip(u1_raw, 0.0, 1.0)
 
 def smc_hbridge_switch(i_target, i_la):
@@ -92,7 +105,16 @@ for k in range(N):
     cost = Q_w * ((w_k - target_w)**2) + R_i * (i_ref_k**2) + R_v * (vc_ref_k**2)
     opti.minimize(cost)
 
-opts = {"ipopt.print_level": 0, "print_time": 0, "ipopt.sb": "yes"}
+# Add tolerances to ignore floating point noise
+opts = {
+    "ipopt.print_level": 0, 
+    "print_time": 0, 
+    "ipopt.sb": "yes",
+    "ipopt.tol": 1e-5,               # Overall solver tolerance
+    "ipopt.acceptable_tol": 1e-4,    # Accept solutions with minor numerical noise
+    "ipopt.constr_viol_tol": 1e-4    # Allow constraint violations up to 0.0001
+}
+opti.solver("ipopt", opts)
 opti.solver("ipopt", opts)
 
 # ==========================================
