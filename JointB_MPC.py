@@ -6,8 +6,8 @@ from casadi import *
 # 1. PARAMETERS & INITIALIZATION
 # ==========================================
 dt_outer = 0.05      # MPC loop runs at 20 Hz
-dt_inner = 0.00001    # SMC loop runs at 100 kHz (Faster than the 34us motor pole)
-sim_time = 1.0       # Simulate for 1 second
+dt_inner = 0.00001   # SMC loop runs at 100 kHz 
+sim_time = 1.25       
 steps_outer = int(sim_time / dt_outer)
 steps_inner_per_outer = int(dt_outer / dt_inner)
 N = 10  
@@ -19,41 +19,30 @@ La = 1.2e-3
 L = 10e-3     
 C = 100e-6    
 J = 6e-7      
-b_damp = 1e-5 
+b_damp = 4e-5 
 Kt = 0.032    
 Ke = 0.0435   
 Vin = 36.0    
 
-target_rpm = 10.0
+target_rpm = 1000.0
 target_w = target_rpm * (2 * np.pi / 60.0) 
 
 # ==========================================
 # 2. INNER LOOP: SMC CONTROLLERS
 # ==========================================
 def smc_buck_duty_cycle(v_target, v_c, i_l, i_la):
-    """ Second-order SMC for Buck Converter (Outputs Duty Cycle 0.0 to 1.0) """
-    lam = 500.0  
-    K = 1.0      # Increased gain to guarantee full saturation 
-    Phi = 500.0  
-
-    # 1. Define the multi-state sliding surface (S2)
+    lam, K, Phi = 500.0, 1.0, 500.0  
     S2 = -(1/C)*i_l + (1/(R*C))*v_c + (1/C)*i_la + lam*(v_target - v_c)
-
-    # 2. Calculate continuous physical dynamics (H_smc) and control gain (g_smc)
     H_smc = (v_c / (L*C)) + (1/(R*C) - lam) * ((1/C)*i_l - (1/(R*C))*v_c - (1/C)*i_la)
     g_smc = -Vin / (L*C)
-
-    # 3. Calculate Equivalent Control
     u_eq = -H_smc / g_smc
-
-    # 4. THE FIX: ADD the boundary layer effort because g_smc is negative!
     u1_raw = u_eq + K * np.clip(S2 / Phi, -1.0, 1.0)
-    
-    # 5. Bound to a physical duty cycle
     return np.clip(u1_raw, 0.0, 1.0)
 
-def smc_hbridge_switch(i_target, i_la):
-    S1 = i_target - i_la
+def smc_hbridge_switch(i_target, i_la, i_integral):
+    """ Integral SMC for H-Bridge to prevent deadband issues """
+    Ki = 5000.0  
+    S1 = (i_target - i_la) + Ki * i_integral
     return 1.0 if S1 > 0 else 0.0
 
 # ==========================================
@@ -80,14 +69,21 @@ F_discrete = Function('F_discrete', [x_mpc, u_mpc], [x_mpc + dt_outer/6 * (k1 + 
 opti = Opti()
 X = opti.variable(2, N+1)
 U = opti.variable(2, N)
-x_initial = opti.parameter(2, 1)
 
-# ---> FIX: Define the initial state constraint ONLY ONCE during setup! <---
+# ---> NEW: Create a Slack Variable to soften the constraints <---
+S_v = opti.variable(1, N)
+opti.subject_to(S_v >= 0) # Slack cannot be negative
+
+x_initial = opti.parameter(2, 1)
 opti.subject_to(X[:, 0] == x_initial)
+u_prev = opti.parameter(2, 1)
 
 Q_w = 100.0  
 R_i = 1.0    
 R_v = 0.1    
+
+max_delta_i = 0.5  
+max_delta_v = 5.0  
 
 for k in range(N):
     opti.subject_to(X[:, k + 1] == F_discrete(X[:, k], U[:, k])) 
@@ -96,25 +92,37 @@ for k in range(N):
     vc_ref_k = U[1, k]
     
     margin = 1.0
-    opti.subject_to(vc_ref_k >= (Ra * i_ref_k + Ke * w_k) + margin)
-    opti.subject_to(vc_ref_k >= -(Ra * i_ref_k + Ke * w_k) + margin)
-
+    
+    # ---> THE FIX: Subtract the slack variable to soften the boundary <---
+    opti.subject_to(vc_ref_k >= (Ra * i_ref_k + Ke * w_k) + margin - S_v[k])
+    opti.subject_to(vc_ref_k >= -(Ra * i_ref_k + Ke * w_k) + margin - S_v[k])
+    
     opti.subject_to(opti.bounded(-1.5, i_ref_k, 1.5)) 
     opti.subject_to(opti.bounded(0, vc_ref_k, Vin))   
 
-    cost = Q_w * ((w_k - target_w)**2) + R_i * (i_ref_k**2) + R_v * (vc_ref_k**2)
+    if k == 0:
+        delta_i = i_ref_k - u_prev[0]
+        delta_v = vc_ref_k - u_prev[1]
+    else:
+        delta_i = i_ref_k - U[0, k-1]
+        delta_v = vc_ref_k - U[1, k-1]
+        
+    opti.subject_to(opti.bounded(-max_delta_i, delta_i, max_delta_i))
+    opti.subject_to(opti.bounded(-max_delta_v, delta_v, max_delta_v))
+
+    # ---> THE FIX: Add a MASSIVE penalty for using the slack <---
+    # This ensures the solver only breaks the reachability rule if absolutely necessary to survive.
+    cost = Q_w * ((w_k - target_w)**2) + R_i * (i_ref_k**2) + R_v * (vc_ref_k**2) + 10000.0 * (S_v[k]**2)
     opti.minimize(cost)
 
-# Add tolerances to ignore floating point noise
 opts = {
     "ipopt.print_level": 0, 
     "print_time": 0, 
     "ipopt.sb": "yes",
-    "ipopt.tol": 1e-5,               # Overall solver tolerance
-    "ipopt.acceptable_tol": 1e-4,    # Accept solutions with minor numerical noise
-    "ipopt.constr_viol_tol": 1e-4    # Allow constraint violations up to 0.0001
+    "ipopt.tol": 1e-5,               
+    "ipopt.acceptable_tol": 1e-4,    
+    "ipopt.constr_viol_tol": 1e-4    
 }
-opti.solver("ipopt", opts)
 opti.solver("ipopt", opts)
 
 # ==========================================
@@ -150,33 +158,39 @@ print(f"Starting Cascade Simulation. Targeting {target_rpm} RPM...")
 t = 0.0
 # Initialize fallback targets just in case step 0 fails
 target_i, target_v = 0.0, 0.0 
+i_error_integral = 0.0  
 
 for step in range(steps_outer):
     # --- OUTER LOOP: RUN MPC ---
-    # Update the parameter value (DO NOT add a new constraint here)
     opti.set_value(x_initial, [current_state[3], current_state[4]]) 
+    opti.set_value(u_prev, [target_i, target_v]) # ---> NEW: Update control memory <---
     
     try:
         sol = opti.solve()
         target_i = sol.value(U[0, 0])
         target_v = sol.value(U[1, 0])
         
-        # Warm-start the next step for faster convergence
         opti.set_initial(X, sol.value(X))
         opti.set_initial(U, sol.value(U))
         
     except RuntimeError:
         print(f"\n--- MPC Failed at t={t:.2f}s! 🪲 ---")
-        print("CasADi Infeasibility Debugger:")
-        # This will explicitly print which constraint was violated
         opti.debug.show_infeasibilities() 
         print("Using previous valid targets to ride through the failure.")
 
-    # --- INNER LOOP: RUN SMC & PLANT ---
+# --- INNER LOOP: RUN SMC & PLANT ---
     for _ in range(steps_inner_per_outer):
         il, vc, ila, w, theta = current_state
+        
+        i_error_integral += (target_i - ila) * dt_inner
+        
+        # ---> THE FIX: Anti-Windup Clamp <---
+        # Limits the maximum integral effect to a safe boundary
+        i_error_integral = np.clip(i_error_integral, -0.01, 0.01) 
+        
         u1_duty = smc_buck_duty_cycle(target_v, vc, il, ila)
-        u2_switch = smc_hbridge_switch(target_i, ila)
+        u2_switch = smc_hbridge_switch(target_i, ila, i_error_integral)
+        
         current_state = rk4_step_plant(current_state, u1_duty, u2_switch, dt_inner)
         t += dt_inner
         
